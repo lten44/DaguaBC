@@ -2,7 +2,7 @@
 
 | 组件 | 来源与适用说明 |
 | --- | --- |
-| Basketball Highlight Editor | 源码以 MIT 许可公开，保留原版权声明和完整许可。感谢 Jafir 与所有上游贡献者。[BHE](https://github.com/fly7632785/basketball-highlight-editor) · [本项目声明](../NOTICE) |
+| Basketball Highlight Editor | 原项目以 MIT 许可公开。DaguaBC 的 AGPL-3.0 发行保留 BHE 的原版权声明与完整 MIT 许可。感谢 Jafir 与所有上游贡献者。[BHE](https://github.com/fly7632785/basketball-highlight-editor) · [上游 MIT](../LICENSES/BHE-MIT.txt) · [本项目声明](../NOTICE) |
 | Source Han Sans SC（思源黑体） | 随源码附 Regular、Medium、Bold 字体及完整 SIL OFL 1.1 许可。[字体许可](../apps/desktop/assets/fonts/SourceHanSans-LICENSE.txt) · [Adobe 上游](https://github.com/adobe-fonts/source-han-sans) |
 | DaguaBC 品牌图形 | 用于识别 DaguaBC 的标识和程序图标。源码许可不授予品牌或商标权利。 |
 | 篮球检测权重与 Ultralytics | 权重来源及作者回复见模型说明。Ultralytics 的 AGPL-3.0 或适用的单独许可仍需遵循。[模型说明](MODEL_AND_DATA_LICENSES.md) · [Ultralytics](https://www.ultralytics.com/license) |

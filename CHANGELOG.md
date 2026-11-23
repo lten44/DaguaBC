@@ -4,6 +4,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- DaguaBC 公共发行采用 GNU AGPL-3.0，保留 Basketball Highlight Editor 原版权及完整 MIT 许可。
+
 ### Research
 
 - 实验性断帧补扫在实录中找回 8 月 6 日 00:56 和 11 月 12 日 08:16 两个穿网片段。见 [断帧补扫试验](research/trajectory/GAP_RESCAN.md)。

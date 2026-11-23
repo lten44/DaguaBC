@@ -32,3 +32,13 @@ flutter run -d windows --dart-define BHE_VERSION=0.2.21
 & .\.venv\Scripts\python.exe -m pip install -r requirements-dml.txt
 & .\.venv\Scripts\python.exe .\scripts\export_mobile_model.py --model .\models\bball_model.pt --output .\models\bball_model.onnx --dynamic
 ```
+
+## 打包 Windows 安装器
+
+使用 [Inno Setup 6](https://jrsoftware.org/isinfo.php) 和 Visual Studio 2022 Build Tools 的 x64 C++ Redistributable。准备一个完整的测试程序目录，顶层为 Flutter `Release` 产物、`LICENSE`、`LICENSES/`、`NOTICE`、字体许可和该构建的第三方说明。`runtime/` 下放置可独立运行的 Python 及依赖（`python/`）、`bin/ffmpeg.exe` 和 `bin/ffprobe.exe`、两个模型（`models/`）。将当前源码树的 `engine/python/`、`src/`、`scripts/`、`docs/architecture/SQLITE_SCHEMA_V1.sql` 按原路径复制到 `runtime/`。
+
+```powershell
+.\scripts\build_daguabc_installer.ps1 -VCRuntime '<x64 VC143 CRT 目录>' -PackageSource '<完整程序目录>' -OutputDirectory '<安装器输出目录>'
+```
+
+打包脚本校验应用版本，生成 Windows x64 安装程序及 SHA-256 校验文件。公开分发时，以该安装包实际携带的运行库版本为准，附上许可及对应源码的下载说明。为自定义构建替换媒体组件后，重新测试播放、时间跳转、代理视频和导出。[第三方与资源声明](THIRD_PARTY_NOTICES.md)

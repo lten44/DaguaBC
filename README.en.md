@@ -10,4 +10,4 @@ DaguaBC is a Windows-first, local basketball highlight editor. It finds likely b
 
 DaguaBC adds a zoomable review timeline, timed hoop recalibration, Windows Chinese IME support for player tags, configurable MP4 exports, and optional 1080p analysis proxies. Original footage is used for export. Analysis, review, and export run locally. Review the candidates before exporting, especially when a hoop is obstructed or the camera moves.
 
-This source snapshot corresponds to **0.2.21**. The application source is provided under the [MIT License](LICENSE), with upstream attribution in [NOTICE](NOTICE). Fonts, branding, models, and runtime dependencies have their own terms. [Model and data provenance](docs/MODEL_AND_DATA_LICENSES.md) · [Third-party notices](docs/THIRD_PARTY_NOTICES.md)
+DaguaBC releases are provided under the [GNU AGPL-3.0](LICENSE). We preserve the original [BHE MIT license and copyright notice](LICENSES/BHE-MIT.txt). Fonts, branding, models, and third-party runtime dependencies retain their own terms. [Upstream attribution](NOTICE) · [Model and data provenance](docs/MODEL_AND_DATA_LICENSES.md) · [Third-party notices](docs/THIRD_PARTY_NOTICES.md)

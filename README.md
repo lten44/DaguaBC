@@ -47,4 +47,4 @@
 
 ## 源码与许可
 
-此归档对应 DaguaBC **0.2.21**，公开预览面向 Windows x64。应用源码沿用 [MIT](LICENSE)，保留 [上游署名和声明](NOTICE)。字体、品牌图形、检测模型和运行依赖分别遵守各自的许可或使用条件。[模型与数据](docs/MODEL_AND_DATA_LICENSES.md) · [第三方说明](docs/THIRD_PARTY_NOTICES.md)
+DaguaBC 的公开发行采用 [AGPL-3.0](LICENSE)。感谢 Jafir 和 BHE 的所有贡献者，我们保留了上游代码的原版权和 [MIT 许可全文](LICENSES/BHE-MIT.txt)。字体、品牌图形、检测模型和第三方运行依赖按各自的条款提供。[上游署名](NOTICE) · [模型与数据](docs/MODEL_AND_DATA_LICENSES.md) · [第三方说明](docs/THIRD_PARTY_NOTICES.md)
