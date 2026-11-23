@@ -1,0 +1,853 @@
+import 'dart:io';
+
+import '../core/app_log.dart';
+import 'engine_client.dart' show EngineException;
+import 'engine_session.dart';
+
+String canonicalProjectPath(String path) {
+  final directory = Directory(path).absolute;
+  try {
+    return directory.resolveSymbolicLinksSync();
+  } on FileSystemException {
+    return directory.path;
+  }
+}
+
+/// 默认项目目录建不了项目时的备用目录，放在应用数据目录里，不受「受控文件夹访问」保护。
+String fallbackProjectsRoot(Map<String, String> env) {
+  final home = env['HOME'] ?? env['USERPROFILE'] ?? Directory.systemTemp.path;
+  if (Platform.isWindows) return '${env['LOCALAPPDATA'] ?? home}\\DaguaBC\\Projects';
+  if (Platform.isMacOS) return '$home/Library/Application Support/BHE/Projects';
+  return '${env['XDG_DATA_HOME'] ?? '$home/.local/share'}/bhe/projects';
+}
+
+class SessionStateException implements Exception {
+  const SessionStateException(this.message);
+
+  final String message;
+
+  @override
+  String toString() => message;
+}
+
+class ProjectSessionCheckpoint {
+  const ProjectSessionCheckpoint({
+    this.projectRoot,
+    this.projectId,
+    this.videoId,
+  });
+
+  final String? projectRoot;
+  final String? projectId;
+  final String? videoId;
+}
+
+/// 后台任务使用的不可变项目上下文。
+///
+/// ProjectSession 本身会随着打开项目而变化；后台轮询必须持有创建时的
+/// projectRoot/videoId，不能在每次请求时重新读取可变会话。
+class ProjectSessionScope {
+  const ProjectSessionScope({
+    required this.engine,
+    required this.projectRoot,
+    this.projectId,
+    this.videoId,
+    this.isCancelled,
+  });
+
+  /// 会话已被替换/页面已销毁时返回 true，重试循环据此提前收手。
+  final bool Function()? isCancelled;
+
+  final EngineSession engine;
+  final String projectRoot;
+  final String? projectId;
+  final String? videoId;
+
+  Future<JsonMap> extractPreview({int timeMs = 1000}) {
+    return retryWhileProjectBusy(
+      'extract_preview',
+      () => engine.extractPreview(
+        projectRoot: projectRoot,
+        videoId: _requireVideoId(),
+        timeMs: timeMs,
+      ),
+      isCancelled: isCancelled,
+    );
+  }
+
+  Future<JsonMap> setAnalysisRange({required int startMs, required int endMs}) {
+    return engine.setAnalysisRange(
+      projectRoot: projectRoot,
+      videoId: _requireVideoId(),
+      startMs: startMs,
+      endMs: endMs,
+    );
+  }
+
+  Stream<JsonMap> pollJob({
+    required String jobId,
+    Duration interval = const Duration(seconds: 1),
+  }) {
+    return engine.pollJob(
+      projectRoot: projectRoot,
+      jobId: jobId,
+      interval: interval,
+    );
+  }
+
+  Future<JsonMap> listCandidates() {
+    return engine.listCandidates(projectRoot: projectRoot);
+  }
+
+  Future<JsonMap> listPlayers() {
+    return engine.listPlayers(projectRoot: projectRoot);
+  }
+
+  Future<JsonMap> createPlayer(String name) {
+    return engine.createPlayer(projectRoot: projectRoot, name: name);
+  }
+
+  Future<JsonMap> setCandidatePlayer({
+    required String candidateId,
+    String? playerId,
+  }) {
+    return engine.setCandidatePlayer(
+      projectRoot: projectRoot,
+      candidateId: candidateId,
+      playerId: playerId,
+    );
+  }
+
+  Future<JsonMap> setCandidatesPlayer({
+    required List<String> candidateIds,
+    String? playerId,
+  }) {
+    return engine.setCandidatesPlayer(
+      projectRoot: projectRoot,
+      candidateIds: candidateIds,
+      playerId: playerId,
+    );
+  }
+
+  Future<JsonMap> updateClipRanges({
+    required List<String> candidateIds,
+    required int beforeMs,
+    required int afterMs,
+    bool overwriteManual = false,
+  }) {
+    return engine.updateClipRanges(
+      projectRoot: projectRoot,
+      candidateIds: candidateIds,
+      beforeMs: beforeMs,
+      afterMs: afterMs,
+      overwriteManual: overwriteManual,
+    );
+  }
+
+  Future<List<JsonMap>> getActiveJobs({String jobType = 'analysis'}) async {
+    final payload = await engine.getActiveJobs(
+      projectRoot: projectRoot,
+      jobType: jobType,
+    );
+    return _mapList(payload['jobs']);
+  }
+
+  Future<JsonMap?> getLatestJob({String jobType = 'analysis'}) async {
+    final payload = await engine.getLatestJob(
+      projectRoot: projectRoot,
+      jobType: jobType,
+    );
+    final job = payload['job'];
+    return job is Map ? job.cast<String, dynamic>() : null;
+  }
+
+  Future<List<JsonMap>> listExports({int limit = 20}) async {
+    final payload = await engine.listExports(
+      projectRoot: projectRoot,
+      limit: limit,
+    );
+    return _mapList(payload['exports']);
+  }
+
+  Future<JsonMap> getStatistics() {
+    return engine.getStatistics(projectRoot: projectRoot);
+  }
+
+  Future<JsonMap> cancelJob({required String jobId}) {
+    return engine.cancelJob(projectRoot: projectRoot, jobId: jobId);
+  }
+
+  Future<JsonMap> waitForJob({
+    required String jobId,
+    Duration interval = const Duration(milliseconds: 200),
+  }) {
+    return engine.waitForJob(
+      projectRoot: projectRoot,
+      jobId: jobId,
+      interval: interval,
+    );
+  }
+
+  String _requireVideoId() {
+    final value = videoId;
+    if (value == null || value.isEmpty) {
+      throw const SessionStateException('当前快照尚未关联视频');
+    }
+    return value;
+  }
+}
+
+/// 项目忙（`PROJECT_BUSY`）是临时状态：打开项目、生成预览代理的几秒里，
+/// 同一项目的读请求会被引擎直接拒掉。这里静默重试，避免用户一进审核页
+/// 就连续收到「视频预览加载失败」「开始记录审核耗时失败」两个错误通知。
+///
+/// 引擎在执行命令之前拒绝这些请求，可以安全地重试。
+const projectBusyRetryDelays = <Duration>[
+  Duration(milliseconds: 300),
+  Duration(milliseconds: 700),
+  Duration(milliseconds: 1500),
+  Duration(milliseconds: 3000),
+  Duration(milliseconds: 4000),
+  Duration(milliseconds: 5500),
+];
+
+Future<JsonMap> retryWhileProjectBusy(
+  String command,
+  Future<JsonMap> Function() request, {
+  List<Duration> delays = projectBusyRetryDelays,
+  bool Function()? isCancelled,
+}) async {
+  for (var attempt = 0; ; attempt++) {
+    try {
+      final result = await request();
+      if (attempt > 0) {
+        appLog('info', 'project', '$command 项目忙，第 ${attempt + 1} 次尝试成功');
+      }
+      return result;
+    } on EngineException catch (error) {
+      // 「项目正在导出」也复用 PROJECT_BUSY，但导出可能要几分钟，重试没有意义。
+      if (!_isRetryableBusy(error) || attempt >= delays.length) rethrow;
+      await Future<void>.delayed(delays[attempt]);
+      if (isCancelled?.call() ?? false) {
+        appLog('info', 'project', '$command 项目忙，页面已失效，停止重试');
+        rethrow;
+      }
+    }
+  }
+}
+
+/// 只有「项目正在读取/请求排队」才值得重试；导出占用和引擎关闭都不重试。
+bool _isRetryableBusy(EngineException error) {
+  if (error.code != 'PROJECT_BUSY') return false;
+  return error.message == '项目正在读取，请稍后重试' ||
+      error.message == '请求队列已满，请稍后重试';
+}
+
+List<JsonMap> _mapList(Object? raw) {
+  if (raw is! List) return <JsonMap>[];
+  return raw
+      .whereType<Map>()
+      .map((item) => Map<String, dynamic>.from(item))
+      .toList();
+}
+
+class ProjectSession {
+  ProjectSession(this.engine);
+
+  final EngineSession engine;
+
+  String? _projectRoot;
+  String? _projectId;
+  String? _videoId;
+  int _sessionRevision = 0;
+
+  String? get projectRoot => _projectRoot;
+  String? get projectId => _projectId;
+  String? get videoId => _videoId;
+
+  ProjectSessionCheckpoint checkpoint() => ProjectSessionCheckpoint(
+    projectRoot: _projectRoot,
+    projectId: _projectId,
+    videoId: _videoId,
+  );
+
+  void restore(ProjectSessionCheckpoint checkpoint) {
+    _sessionRevision++;
+    _projectRoot = checkpoint.projectRoot;
+    _projectId = checkpoint.projectId;
+    _videoId = checkpoint.videoId;
+  }
+
+  /// 捕获当前项目上下文，供可能跨越项目切换的后台任务使用。
+  ProjectSessionScope snapshot({bool requireVideo = false}) {
+    final root = _requireProjectRoot();
+    final videoId = _videoId;
+    if (requireVideo && (videoId == null || videoId.isEmpty)) {
+      throw const SessionStateException('当前会话尚未关联视频');
+    }
+    return ProjectSessionScope(
+      engine: engine,
+      projectRoot: root,
+      projectId: _projectId,
+      videoId: videoId,
+    );
+  }
+
+  Future<JsonMap> createProject({
+    required String name,
+    required String rootPath,
+    String? projectId,
+    String language = 'zh-CN',
+  }) async {
+    final revision = ++_sessionRevision;
+    final payload = await engine.createProject(
+      name: name,
+      rootPath: rootPath,
+      projectId: projectId,
+      language: language,
+    );
+    if (revision != _sessionRevision) return payload;
+    _projectRoot = canonicalProjectPath(
+      (payload['project'] as Map?)?['root_path']?.toString() ?? rootPath,
+    );
+    _projectId = _nestedId(payload, 'project');
+    _videoId = null;
+    return payload;
+  }
+
+  Future<JsonMap> openProject(String projectRoot) async {
+    final revision = ++_sessionRevision;
+    final payload = await engine.openProject(projectRoot: projectRoot);
+    if (revision != _sessionRevision) return payload;
+    final project = payload['project'];
+    final video = payload['video'];
+    _projectRoot = canonicalProjectPath(
+      payload['project_root']?.toString() ?? projectRoot,
+    );
+    _projectId = project is Map ? project['id']?.toString() : null;
+    _videoId = video is Map ? video['id']?.toString() : null;
+    return payload;
+  }
+
+  Future<JsonMap> deleteProject(String projectRoot) async {
+    final payload = await engine.deleteProject(projectRoot: projectRoot);
+    if (_projectRoot == canonicalProjectPath(projectRoot)) reset();
+    return payload;
+  }
+
+  Future<JsonMap> updateProjectSettings({String? name, String? themeMode}) {
+    return engine.updateProjectSettings(
+      projectRoot: _requireProjectRoot(),
+      name: name,
+      themeMode: themeMode,
+    );
+  }
+
+  Future<JsonMap> getAnalysisMode() {
+    return engine.getAnalysisMode(projectRoot: _requireProjectRoot());
+  }
+
+  Future<JsonMap> setAnalysisMode(String mode) {
+    return engine.setAnalysisMode(
+      projectRoot: _requireProjectRoot(),
+      mode: mode,
+    );
+  }
+
+  Future<List<JsonMap>> loadRecentProjects({
+    required String knownRoot,
+    int limit = 20,
+  }) async {
+    if (knownRoot.trim().isEmpty) {
+      throw const SessionStateException('最近项目目录不能为空');
+    }
+    final payload = await engine.listRecentProjectsInRoot(
+      knownRoot: knownRoot,
+      limit: limit,
+    );
+    final projects = payload['projects'];
+    if (projects is! List) return <JsonMap>[];
+    return projects
+        .whereType<Map>()
+        .map((project) => Map<String, dynamic>.from(project))
+        .toList();
+  }
+
+  Future<JsonMap> inspectVideo({required String videoPath}) {
+    return engine.inspectVideo(videoPath: videoPath);
+  }
+
+  /// 切换当前操作的视频段，项目内的多段视频共用一个会话。
+  void setActiveVideo(String videoId) {
+    _sessionRevision++;
+    _videoId = videoId;
+  }
+
+  /// 把视频追加到项目末尾，不改变当前操作的视频段。
+  Future<JsonMap> addVideo(String videoPath, {String? analysisProxy}) {
+    return engine.linkVideo(
+      projectRoot: _requireProjectRoot(),
+      videoPath: videoPath,
+      analysisProxy: analysisProxy,
+    );
+  }
+
+  Future<JsonMap> reorderVideos(List<String> videoIds) {
+    return engine.reorderVideos(
+      projectRoot: _requireProjectRoot(),
+      videoIds: videoIds,
+    );
+  }
+
+  Future<JsonMap> setAnalysisQueue(
+    List<String> videoIds, {
+    double beforeSeconds = 3,
+    double afterSeconds = 1,
+  }) {
+    return engine.setAnalysisQueue(
+      projectRoot: _requireProjectRoot(),
+      videoIds: videoIds,
+      beforeSeconds: beforeSeconds,
+      afterSeconds: afterSeconds,
+    );
+  }
+
+  Future<JsonMap> linkVideo(String videoPath, {String? analysisProxy}) async {
+    final root = _requireProjectRoot();
+    final revision = _sessionRevision;
+    final payload = await engine.linkVideo(
+      projectRoot: root,
+      videoPath: videoPath,
+      analysisProxy: analysisProxy,
+    );
+    if (revision == _sessionRevision && root == _projectRoot) {
+      _videoId = _nestedId(payload, 'video');
+    }
+    return payload;
+  }
+
+  Future<JsonMap> relinkVideo(String videoPath) async {
+    final root = _requireProjectRoot();
+    final videoId = _requireVideoId();
+    return engine.relinkVideo(
+      projectRoot: root,
+      videoId: videoId,
+      videoPath: videoPath,
+    );
+  }
+
+  Future<JsonMap> extractPreview({int timeMs = 1000, String? videoId}) {
+    final root = _requireProjectRoot();
+    final targetVideoId = videoId ?? _requireVideoId();
+    final revision = _sessionRevision;
+    return retryWhileProjectBusy(
+      'extract_preview',
+      () => engine.extractPreview(
+        projectRoot: root,
+        videoId: targetVideoId,
+        timeMs: timeMs,
+      ),
+      // 重试途中切了项目/换了视频就不要再重试旧项目。
+      isCancelled: () => _sessionRevision != revision,
+    );
+  }
+
+  Future<JsonMap> setAnalysisRange({required int startMs, required int endMs}) {
+    return engine.setAnalysisRange(
+      projectRoot: _requireProjectRoot(),
+      videoId: _requireVideoId(),
+      startMs: startMs,
+      endMs: endMs,
+    );
+  }
+
+  Future<JsonMap> getWorkflowDraft() {
+    return engine.getWorkflowDraft(projectRoot: _requireProjectRoot());
+  }
+
+  Future<JsonMap> saveWorkflowDraft(JsonMap draft) {
+    return engine.saveWorkflowDraft(
+      projectRoot: _requireProjectRoot(),
+      draft: draft,
+    );
+  }
+
+  Future<JsonMap> clearWorkflowDraft() {
+    return engine.clearWorkflowDraft(projectRoot: _requireProjectRoot());
+  }
+
+  Future<JsonMap> suggestRoi({
+    String? videoId,
+    String? modelPath,
+    int? startMs,
+    double? sampleFps,
+    double? duration,
+    int? maxSamples,
+    double? confidence,
+  }) {
+    return engine.suggestRoi(
+      projectRoot: _requireProjectRoot(),
+      videoId: videoId ?? _requireVideoId(),
+      modelPath: modelPath,
+      startMs: startMs,
+      sampleFps: sampleFps,
+      duration: duration,
+      maxSamples: maxSamples,
+      confidence: confidence,
+    );
+  }
+
+  Future<JsonMap> saveRoi({
+    required num x1,
+    required num y1,
+    required num x2,
+    required num y2,
+    String? name,
+    JsonMap? calibration,
+    String? videoId,
+  }) {
+    return engine.saveRoi(
+      projectRoot: _requireProjectRoot(),
+      videoId: videoId ?? _requireVideoId(),
+      x1: x1,
+      y1: y1,
+      x2: x2,
+      y2: y2,
+      name: name,
+      calibration: calibration,
+    );
+  }
+
+  Future<JsonMap> startAnalysis({
+    String? videoId,
+    double? sampleFps,
+    double? windowSeconds,
+    double? beforeSeconds,
+    double? afterSeconds,
+    int? proxyWidth,
+    int? proxyHeight,
+    double? proxyFps,
+    String? modelPath,
+    String? mode,
+    int? segmentAtMs,
+  }) {
+    return engine.startAnalysis(
+      projectRoot: _requireProjectRoot(),
+      videoId: videoId ?? _requireVideoId(),
+      sampleFps: sampleFps,
+      windowSeconds: windowSeconds,
+      beforeSeconds: beforeSeconds,
+      afterSeconds: afterSeconds,
+      proxyWidth: proxyWidth,
+      proxyHeight: proxyHeight,
+      proxyFps: proxyFps,
+      modelPath: modelPath,
+      segmentAtMs: segmentAtMs,
+      mode: mode,
+    );
+  }
+
+  Future<JsonMap> retryAnalysis({
+    required String jobId,
+    double? sampleFps,
+    double? windowSeconds,
+    double? beforeSeconds,
+    double? afterSeconds,
+    int? proxyWidth,
+    int? proxyHeight,
+    double? proxyFps,
+    String? modelPath,
+    String? mode,
+  }) {
+    return engine.retryAnalysis(
+      projectRoot: _requireProjectRoot(),
+      videoId: _requireVideoId(),
+      jobId: jobId,
+      sampleFps: sampleFps,
+      windowSeconds: windowSeconds,
+      beforeSeconds: beforeSeconds,
+      afterSeconds: afterSeconds,
+      proxyWidth: proxyWidth,
+      proxyHeight: proxyHeight,
+      proxyFps: proxyFps,
+      modelPath: modelPath,
+      mode: mode,
+    );
+  }
+
+  Future<JsonMap> retryExport({required String jobId}) {
+    return engine.retryExport(projectRoot: _requireProjectRoot(), jobId: jobId);
+  }
+
+  Stream<JsonMap> pollJob({
+    required String jobId,
+    Duration interval = const Duration(seconds: 1),
+  }) {
+    return engine.pollJob(
+      projectRoot: _requireProjectRoot(),
+      jobId: jobId,
+      interval: interval,
+    );
+  }
+
+  Future<JsonMap> waitForJob({
+    required String jobId,
+    Duration interval = const Duration(seconds: 1),
+  }) {
+    return engine.waitForJob(
+      projectRoot: _requireProjectRoot(),
+      jobId: jobId,
+      interval: interval,
+    );
+  }
+
+  Future<JsonMap> cancelJob({required String jobId}) {
+    return engine.cancelJob(projectRoot: _requireProjectRoot(), jobId: jobId);
+  }
+
+  Future<JsonMap> listCandidates() {
+    return engine.listCandidates(projectRoot: _requireProjectRoot());
+  }
+
+  Future<JsonMap> createManualCandidate({
+    required int startMs,
+    required int endMs,
+    int? eventTimeMs,
+  }) {
+    return engine.createManualCandidate(
+      projectRoot: _requireProjectRoot(),
+      videoId: _requireVideoId(),
+      startMs: startMs,
+      endMs: endMs,
+      eventTimeMs: eventTimeMs,
+    );
+  }
+
+  Future<JsonMap> listPlayers() {
+    return engine.listPlayers(projectRoot: _requireProjectRoot());
+  }
+
+  Future<JsonMap> createPlayer(String name) {
+    return engine.createPlayer(projectRoot: _requireProjectRoot(), name: name);
+  }
+
+  Future<JsonMap> renamePlayer(String playerId, String name) {
+    return engine.renamePlayer(projectRoot: _requireProjectRoot(), playerId: playerId, name: name);
+  }
+
+  Future<JsonMap> deletePlayer(String playerId) {
+    return engine.deletePlayer(
+      projectRoot: _requireProjectRoot(),
+      playerId: playerId,
+    );
+  }
+
+  Future<JsonMap> setCandidatePlayer({
+    required String candidateId,
+    String? playerId,
+  }) {
+    return _retryReviewWrite(
+      'set_candidate_player',
+      (root) => engine.setCandidatePlayer(
+        projectRoot: root,
+        candidateId: candidateId,
+        playerId: playerId,
+      ),
+    );
+  }
+
+  Future<JsonMap> setCandidatesPlayer({
+    required List<String> candidateIds,
+    String? playerId,
+  }) {
+    return _retryReviewWrite(
+      'set_candidates_player',
+      (root) => engine.setCandidatesPlayer(
+        projectRoot: root,
+        candidateIds: candidateIds,
+        playerId: playerId,
+      ),
+    );
+  }
+
+  Future<JsonMap> updateClipRanges({
+    required List<String> candidateIds,
+    required int beforeMs,
+    required int afterMs,
+    bool overwriteManual = false,
+  }) {
+    return engine.updateClipRanges(
+      projectRoot: _requireProjectRoot(),
+      candidateIds: candidateIds,
+      beforeMs: beforeMs,
+      afterMs: afterMs,
+      overwriteManual: overwriteManual,
+    );
+  }
+
+  Future<JsonMap> listReviewHistory(String candidateId) {
+    return engine.listReviewHistory(
+      projectRoot: _requireProjectRoot(),
+      candidateId: candidateId,
+    );
+  }
+
+  Future<JsonMap> startReview(String candidateId, {String? reviewStartedAt}) {
+    final root = _requireProjectRoot();
+    final revision = _sessionRevision;
+    return retryWhileProjectBusy(
+      'start_review',
+      () => engine.startReview(
+        projectRoot: root,
+        candidateId: candidateId,
+        reviewStartedAt: reviewStartedAt,
+      ),
+      isCancelled: () => _sessionRevision != revision,
+    );
+  }
+
+  Future<JsonMap> reviewCandidate(
+    String candidateId, {
+    required String status,
+    String? note,
+    String? reason,
+  }) {
+    return _retryReviewWrite(
+      'review_candidate',
+      (root) => engine.reviewCandidate(
+        projectRoot: root,
+        candidateId: candidateId,
+        status: status,
+        note: note,
+        reason: reason,
+      ),
+    );
+  }
+
+  Future<JsonMap> _retryReviewWrite(
+    String command,
+    Future<JsonMap> Function(String root) request,
+  ) {
+    final root = _requireProjectRoot();
+    final revision = _sessionRevision;
+    return retryWhileProjectBusy(
+      command,
+      () => request(root),
+      isCancelled: () => _sessionRevision != revision,
+    );
+  }
+
+  Future<JsonMap> updateClipRange({
+    required String candidateId,
+    required int startMs,
+    required int endMs,
+  }) {
+    return engine.updateClipRange(
+      projectRoot: _requireProjectRoot(),
+      candidateId: candidateId,
+      startMs: startMs,
+      endMs: endMs,
+    );
+  }
+
+  Future<JsonMap> startExport({
+    String mode = 'separate',
+    String? outputDir,
+    String? outputPath,
+    List<String>? playerIds,
+    bool? includeUnassigned,
+    String effect = 'none',
+    JsonMap? encoding,
+  }) {
+    return engine.startExport(
+      projectRoot: _requireProjectRoot(),
+      mode: mode,
+      outputDir: outputDir,
+      outputPath: outputPath,
+      playerIds: playerIds,
+      includeUnassigned: includeUnassigned,
+      effect: effect,
+      encoding: encoding,
+    );
+  }
+
+  Future<JsonMap> getStatistics() {
+    return engine.getStatistics(projectRoot: _requireProjectRoot());
+  }
+
+  Future<List<JsonMap>> getActiveJobs() async {
+    final payload = await engine.getActiveJobs(
+      projectRoot: _requireProjectRoot(),
+    );
+    final jobs = payload['jobs'];
+    if (jobs is! List) return <JsonMap>[];
+    return jobs
+        .whereType<Map>()
+        .map((job) => Map<String, dynamic>.from(job))
+        .toList();
+  }
+
+  Future<List<JsonMap>> getActiveExportJobs() async {
+    final payload = await engine.getActiveJobs(
+      projectRoot: _requireProjectRoot(),
+      jobType: 'export',
+    );
+    final jobs = payload['jobs'];
+    if (jobs is! List) return <JsonMap>[];
+    return jobs
+        .whereType<Map>()
+        .map((job) => Map<String, dynamic>.from(job))
+        .toList();
+  }
+
+  Future<List<JsonMap>> listExports({int limit = 20}) async {
+    final payload = await engine.listExports(
+      projectRoot: _requireProjectRoot(),
+      limit: limit,
+    );
+    final exports = payload['exports'];
+    if (exports is! List) return <JsonMap>[];
+    return exports
+        .whereType<Map>()
+        .map((item) => Map<String, dynamic>.from(item))
+        .toList();
+  }
+
+  void clearVideo() {
+    _sessionRevision++;
+    _videoId = null;
+  }
+
+  void reset() {
+    _sessionRevision++;
+    _projectRoot = null;
+    _projectId = null;
+    _videoId = null;
+  }
+
+  String _requireProjectRoot() {
+    final value = _projectRoot;
+    if (value == null || value.isEmpty) {
+      throw const SessionStateException('当前会话尚未创建项目');
+    }
+    return value;
+  }
+
+  String _requireVideoId() {
+    final value = _videoId;
+    if (value == null || value.isEmpty) {
+      throw const SessionStateException('当前会话尚未关联视频');
+    }
+    return value;
+  }
+
+  String _nestedId(JsonMap payload, String key) {
+    final value = payload[key];
+    if (value is Map &&
+        value['id'] is String &&
+        (value['id'] as String).isNotEmpty) {
+      return value['id'] as String;
+    }
+    throw SessionStateException('Engine 返回的 $key 缺少 id');
+  }
+}

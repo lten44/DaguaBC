@@ -1,0 +1,17 @@
+.venv/
+.dart_tool/
+.idea/
+.flutter-plugins-dependencies
+build/
+dist/
+__pycache__/
+.pytest_cache/
+models/*.pt
+models/*.onnx
+models/*.onnx.names.json
+*.db
+*.db-wal
+*.db-shm
+*.mp4
+*.mov
+*.mkv

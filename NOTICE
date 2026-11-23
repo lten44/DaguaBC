@@ -1,0 +1,13 @@
+DaguaBC (DaGuaBasketballClip)
+
+Derived from Basketball Highlight Editor by Jafir (fly7632785) and the BHE contributors.
+Upstream: https://github.com/fly7632785/basketball-highlight-editor
+Upstream base: 0472b95072c7cdd4fe3864b1a1288e27ab5ee379
+This snapshot: DaguaBC 0.2.21, source commit dbc399a513aeeb40a59787a5456ce009d3dabcf6
+
+The original copyright and MIT license are preserved in LICENSE.
+Additional rim-check work is credited to EddyLL06 (BHE pull request #18):
+https://github.com/fly7632785/basketball-highlight-editor/pull/18
+
+See docs/MODEL_AND_DATA_LICENSES.md and docs/THIRD_PARTY_NOTICES.md
+for the separate terms and provenance of models, assets, and dependencies.
