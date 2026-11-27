@@ -2,7 +2,7 @@
 
 DaguaBC is a Windows-first, local basketball highlight editor. It finds likely baskets in fixed-camera footage of one hoop so you can review clips, add missed plays, tag players, and export MP4 reels.
 
-**[Download the Windows x64 installer](https://github.com/lten44/DaguaBC/releases/download/v0.2.21-windows.1/DaguaBC-0.2.21-Windows-x64-Setup.exe)** · [Release notes, source archives, and checksums](https://github.com/lten44/DaguaBC/releases/tag/v0.2.21-windows.1)
+**[Download the Windows x64 installer](https://github.com/lten44/DaguaBC/releases/download/v0.2.22/DaguaBC-0.2.22-Windows-x64-Setup.exe)** · [Release notes, source archives, and checksums](https://github.com/lten44/DaguaBC/releases/tag/v0.2.22)
 
 ## Special thanks to the creator of BHE
 

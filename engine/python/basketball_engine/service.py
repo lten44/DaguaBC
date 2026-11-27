@@ -445,7 +445,8 @@ class EngineService:
         projects = []
         for project_root in project_roots:
             try:
-                store, context = self._existing_store({"project_root": str(project_root)})
+                store = ProjectStore(project_root)
+                context, preview_candidates = store.recent_context()
                 modified_at = datetime.fromtimestamp(
                     store.db_path.stat().st_mtime,
                     tz=timezone.utc,
@@ -455,17 +456,17 @@ class EngineService:
             projects.append({
                 **context,
                 "last_modified_at": modified_at,
-                "cover_path": self._project_cover(store, context.get("video")),
+                "cover_path": self._project_cover(store, context.get("video"), preview_candidates),
             })
         projects.sort(key=lambda item: item["last_modified_at"], reverse=True)
         return {"projects": projects[:limit], "scanned_roots": scanned_roots}
 
     @classmethod
-    def _project_cover(cls, store: ProjectStore, video: Dict[str, Any] | None) -> str | None:
+    def _project_cover(cls, store: ProjectStore, video: Dict[str, Any] | None, candidates: list[Dict[str, Any]]) -> str | None:
         """Pick an already extracted frame; listing projects never runs ffmpeg."""
         if not video:
             return None
-        rows = sorted(store.list_candidates(video["id"]), key=lambda row: int(row["event_time_ms"]))
+        rows = sorted((row for row in candidates if row["video_id"] == video["id"]), key=lambda row: int(row["event_time_ms"]))
         for row in rows:
             if row.get("selection_status") == "excluded":
                 continue
@@ -1037,6 +1038,28 @@ class EngineService:
             raise ProtocolError("VIDEO_NOT_FOUND", str(exc)) from exc
         return {"video": video}
 
+    def _cached_proxy_probe(self, proxy_path) -> Dict[str, Any]:
+        """审核页批量取预览时，每个时间点都会为校验几何而 ffprobe 同一个代理
+        文件；大项目里同一代理会被探测上百次。按 (路径, 大小, mtime_ns) 缓存
+        探测结果，代理被重写时键自然失效。只在 heavy 单线程上被调用。"""
+        cache_key = None
+        try:
+            stat = Path(proxy_path).stat()
+            cache_key = (str(proxy_path), stat.st_size, stat.st_mtime_ns)
+        except OSError:
+            pass
+        cache = getattr(self, "_proxy_probe_cache", None)
+        if cache is None:
+            cache = self._proxy_probe_cache = {}
+        if cache_key is not None and cache_key in cache:
+            return cache[cache_key]
+        info = self.inspect_video({"video_path": str(proxy_path)})
+        if cache_key is not None:
+            if len(cache) >= 16:
+                cache.pop(next(iter(cache)))
+            cache[cache_key] = info
+        return info
+
     def extract_preview(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         store = self._require_store(payload)
         identity = self._project_identity(store)
@@ -1073,7 +1096,7 @@ class EngineService:
         proxy = self._latest_proxy_video(store, video["id"])
         if proxy is not None and proxy[1] <= time_ms < proxy[2] - 1000:
             try:
-                info = self.inspect_video({"video_path": str(proxy[0])})
+                info = self._cached_proxy_probe(proxy[0])
                 pw, ph = int(info.get("width") or 0), int(info.get("height") or 0)
                 vw, vh = int(video.get("width") or 0), int(video.get("height") or 0)
                 duration = int(info.get("duration_ms") or 0)
@@ -1449,7 +1472,7 @@ class EngineService:
             retry_payload["output_dir"] = checkpoint["output_dir"]
         if checkpoint.get("output_path") is not None:
             retry_payload["output_path"] = checkpoint["output_path"]
-        for key in ("player_ids", "include_unassigned", "effect"):
+        for key in ("player_ids", "include_unassigned", "effect", "framing"):
             if key in checkpoint:
                 retry_payload[key] = checkpoint[key]
         # Check what start_export would reject before ending the old job, so a
@@ -2610,6 +2633,7 @@ class EngineService:
         source_unverified = any(not video.get("source_fingerprint") for video in videos.values())
         mode = payload.get("mode", "separate")
         effect = payload.get("effect", "none")
+        framing = payload.get("framing", "original")
         try:
             settings = ExportSettings.parse(payload.get("encoding"))
         except (ValueError, TypeError) as exc:
@@ -2680,6 +2704,7 @@ class EngineService:
                     cancel_check=cancel_check,
                     process_callback=process_callback,
                     effect=effect,
+                    **({"framing": framing} if framing != "original" else {}),
                     **({"settings": settings} if settings is not None else {}),
                 )
             else:
@@ -2692,6 +2717,7 @@ class EngineService:
                     cancel_check=cancel_check,
                     process_callback=process_callback,
                     effect=effect,
+                    **({"framing": framing} if framing != "original" else {}),
                     **({"settings": settings} if settings is not None else {}),
                 )
         except (OSError, ValueError, subprocess.CalledProcessError) as exc:
@@ -2813,6 +2839,7 @@ class EngineService:
         process_callback=None,
         effect: str = "none",
         settings: ExportSettings | None = None,
+        framing: str = "original",
     ) -> Dict[str, Any]:
         """每个标签各合成一个视频，文件名用标签名；中间片段放在项目缓存里。"""
         adjusted = 0
@@ -2858,6 +2885,7 @@ class EngineService:
                     cancel_check=cancel_check,
                     process_callback=process_callback,
                     effect=effect,
+                    **({"framing": framing} if framing != "original" else {}),
                     **({"settings": settings} if settings is not None else {}),
                 )
                 files.extend(result["files"])
@@ -2970,6 +2998,8 @@ class EngineService:
         return requested_player_ids, include_unassigned, candidate_snapshot
 
     def start_export(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        if payload.get("framing", "original") not in ("original", "portrait_916", "portrait_blur"):
+            raise ProtocolError("INVALID_REQUEST", "画面格式无效")
         try:
             settings = ExportSettings.parse(payload.get("encoding"))
         except (ValueError, TypeError) as exc:
@@ -3009,6 +3039,7 @@ class EngineService:
                 "player_ids": sorted(selected_players) if requested_player_ids is not None else None,
                 "include_unassigned": include_unassigned,
                 "effect": payload.get("effect", "none"),
+                "framing": payload.get("framing", "original"),
                 **({"encoding": settings.json()} if settings is not None else {}),
                 "candidate_snapshot": candidate_snapshot,
                 "candidate_count": len(candidate_snapshot),

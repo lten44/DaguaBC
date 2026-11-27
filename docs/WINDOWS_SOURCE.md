@@ -21,10 +21,10 @@ $env:BHE_REPO_ROOT = (Get-Location).Path
 $env:BHE_PYTHON = (Resolve-Path .\.venv\Scripts\python.exe).Path
 Set-Location apps\desktop
 flutter pub get
-flutter run -d windows --dart-define BHE_VERSION=0.2.21
+flutter run -d windows --dart-define BHE_VERSION=0.2.22
 ```
 
-如需验证 Windows Release 编译，在 `apps\desktop` 执行 `flutter build windows --release --dart-define BHE_VERSION=0.2.21`，产物在 `build\windows\x64\runner\Release`。按上述方式提供 Python、模型和 FFmpeg 后，可从同一个终端启动产物。该目录是编译结果，公开免安装包还需要整理配套运行时及其许可。
+如需验证 Windows Release 编译，在 `apps\desktop` 执行 `flutter build windows --release --dart-define BHE_VERSION=0.2.22`，产物在 `build\windows\x64\runner\Release`。按上述方式提供 Python、模型和 FFmpeg 后，可从同一个终端启动产物。该目录是编译结果，公开免安装包还需要整理配套运行时及其许可。
 
 使用 CPU 即可运行。需要 DirectML 时，在根目录将 `requirements-dml.txt` 安装到同一个 Python 环境，用同一权重生成动态批量 ONNX。
 

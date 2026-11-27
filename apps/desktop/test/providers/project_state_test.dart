@@ -160,9 +160,12 @@ void main() {
       ]);
       addTearDown(container.dispose);
       expect(await container.read(projectProvider.notifier).cleanupProjectCaches(root: storage.path), 1);
-      expect(transport.calls, [
-        {'project_root': canonicalProjectPath(project.path), 'include_exports': false},
-      ]);
+      final cleanupCall = transport.calls.single;
+      expect(cleanupCall['include_exports'], isFalse);
+      expect(
+        FileSystemEntity.identicalSync(cleanupCall['project_root'] as String, project.path),
+        isTrue,
+      );
       expect(File('${project.path}/project.db').existsSync(), isTrue);
     });
 
@@ -1804,6 +1807,7 @@ class _FakeProjectSession extends ProjectSession {
     List<String>? playerIds,
     bool? includeUnassigned,
     String effect = 'none',
+    String framing = 'original',
     Map<String, dynamic>? encoding,
   }) async {
     exportCalls++;

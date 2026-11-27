@@ -193,7 +193,9 @@ void main() {
     await tester.pumpAndSettle();
     expect(tester.widget<CsButton>(find.byKey(const Key('export-start'))).onPressed, isNull);
     expect(find.text('上一次导出启动结果未确认，请先查看导出任务'), findsOneWidget);
-    await tester.tap(find.byKey(const Key('export-check-unknown')));
+    final check = find.byKey(const Key('export-check-unknown'));
+    await tester.ensureVisible(check);
+    await tester.tap(check);
     await tester.pumpAndSettle();
     expect(tester.widget<CsButton>(find.byKey(const Key('export-start'))).onPressed, isNotNull);
   });
@@ -815,6 +817,7 @@ class _FilterExportNotifier extends _ExportNotifier {
     List<String>? playerIds,
     bool? includeUnassigned,
     String effect = 'none',
+    String framing = 'original',
     Map<String, dynamic>? encoding,
   }) async {
     exportedMode = mode;
@@ -952,6 +955,7 @@ class _TrackingExportNotifier extends _ExportNotifier {
     List<String>? playerIds,
     bool? includeUnassigned,
     String effect = 'none',
+    String framing = 'original',
     Map<String, dynamic>? encoding,
   }) async {
     exports.add('$mode:${outputPath ?? outputDir}');

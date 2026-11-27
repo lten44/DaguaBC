@@ -59,6 +59,7 @@ class _ExportScreenState extends ConsumerState<ExportScreen> {
     'codec': _codec, 'bitrate_mbps': _bitrate, 'max_height': _maxHeight,
     'fps': _fps, 'hardware': _hardware, 'remove_overlap': _removeOverlap,
   };
+  String _framing = 'original';
 
   static const _effectKey = 'export_goal_effect';
 
@@ -335,6 +336,28 @@ class _ExportScreenState extends ConsumerState<ExportScreen> {
             ],
           ],
         ),
+        ),
+        const SizedBox(height: Spacing.md),
+        _ExportSection(
+          title: context.bheText('画面'),
+          hint: '',
+          child: Wrap(
+            spacing: Spacing.sm,
+            children: [
+              for (final option in const {
+                'original': '原比例',
+                'portrait_916': '竖屏 9:16（跟球）',
+              }.entries)
+                ChoiceChip(
+                  key: Key('export-framing-${option.key}'),
+                  label: Text(context.bheText(option.value)),
+                  selected: _framing == option.key,
+                  onSelected: busy
+                      ? null
+                      : (_) => setState(() => _framing = option.key),
+                ),
+            ],
+          ),
         ),
         const SizedBox(height: Spacing.md),
         _ExportSection(
@@ -692,6 +715,7 @@ class _ExportScreenState extends ConsumerState<ExportScreen> {
         mode,
         effect: _effect,
         encoding: _encoding,
+        framing: _framing,
         outputPath: merge ? path : null,
         outputDir: merge ? null : path,
         playerIds: playerIds,
@@ -1641,6 +1665,7 @@ String _exportStageLabel(String stage) =>
       'verify_source': '复核原视频',
       'cancelling': '正在取消导出…',
       'export_clips': '生成片段',
+      'portrait_tracking': '跟踪篮球',
       'merge_clips': '合并片段',
       'persist_export': '保存导出记录',
     }[stage] ??

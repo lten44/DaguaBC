@@ -1,7 +1,9 @@
 from pathlib import Path
+from io import StringIO
 import json
 import sys
 import time
+from unittest.mock import Mock
 
 import pytest
 
@@ -511,3 +513,146 @@ def test_a_long_failure_leads_with_the_real_error_not_a_cut_line(tmp_path: Path)
     assert "processing frame line" in str(error.value)
     # 保留的日志从整行开始，没有被切断的半行
     assert all(line.startswith("processing frame line") or line.startswith("RuntimeError") for line in lines[1:] if line)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX signal return codes")
+@pytest.mark.parametrize("script_name", ["scan_video.py", "refine_dynamic_candidates.py"])
+@pytest.mark.parametrize("cpu_exit", [0, 1, -6, None])
+def test_native_inference_crash_retries_cpu_once(tmp_path, capsys, script_name, cpu_exit):
+    script = tmp_path / script_name
+    attempts = tmp_path / "attempts.jsonl"
+    output = tmp_path / "refined.json"
+    manifest = tmp_path / "manifest.json"
+    script.write_text(
+        "import sys, json, os, signal\n"
+        f"attempts = {str(attempts)!r}\n"
+        "with open(attempts, 'a') as f: f.write(json.dumps(sys.argv[1:]) + '\\n')\n"
+        "device = sys.argv[sys.argv.index('--device') + 1]\n"
+        "if device != 'cpu':\n"
+        f"    open({str(output)!r}, 'w').write('{{}}')\n"
+        "    print('native mutex failure', file=sys.stderr, flush=True)\n"
+        "    os.kill(os.getpid(), signal.SIGABRT)\n"
+        "assert '--cache-dir' not in sys.argv\n"
+        + (f"open({str(output)!r}, 'w').write('{{\"results\": []}}')\n" if cpu_exit is not None else "")
+        + ("os.kill(os.getpid(), signal.SIGABRT)\n" if cpu_exit == -6 else f"sys.exit({cpu_exit or 0})\n"),
+        encoding="utf-8",
+    )
+    command = [sys.executable, str(script), "--device", "auto", "--cache-dir", str(tmp_path / "cache")]
+    streamed, processes = [], []
+    def execute():
+        return run_pipeline([command], output, manifest_path=manifest,
+                            stage_outputs=[output], stage_names=["coarse_scan"],
+                            output_callback=lambda stage, line: streamed.append(line),
+                            process_callback=processes.append)
+    if cpu_exit == 0:
+        result = execute()
+        assert result["refined"] == {"results": []}
+        assert any("CPU fallback succeeded" in line for line in result["logs"])
+    else:
+        with pytest.raises(RuntimeError, match="未生成有效产物" if cpu_exit is None else "执行失败"):
+            execute()
+    calls = [json.loads(line) for line in attempts.read_text().splitlines()]
+    assert len(calls) == 2
+    assert calls[0] == command[2:]
+    assert calls[1] == ["--device", "cpu"]
+    assert command[-2] == "--cache-dir"  # caller's commands remain unchanged
+    saved = json.loads(manifest.read_text())["stages"]["coarse_scan"]
+    assert saved["state"] == ("completed" if cpu_exit == 0 else "failed")
+    assert saved["cpu_fallback"]["exit"] == -6
+    assert "native mutex failure" in saved["cpu_fallback"]["diagnostic"]
+    assert any("retrying CPU once" in line for line in streamed)
+    assert "native exit=-6" in capsys.readouterr().err
+    assert len([p for p in processes if p is not None]) == 2
+    assert processes[-1] is None
+
+
+@pytest.mark.parametrize("initial_exit,cpu_exit", [
+    (0xC0000005, 0),
+    (0xC000001D, 0),
+    (0xC0000005, 0xC000001D),
+    (1, None),
+    (0xC000013A, None),  # Windows console interruption
+])
+def test_refine_retries_reported_windows_crashes_once(
+    tmp_path, monkeypatch, initial_exit, cpu_exit,
+):
+    output = tmp_path / "refined.json"
+    manifest = tmp_path / "manifest.json"
+    calls = []
+
+    def start_process(command, **kwargs):
+        exit_code = cpu_exit if calls else initial_exit
+        assert exit_code is not None
+        calls.append(command)
+        if exit_code == 0:
+            output.write_text('{"results": []}', encoding="utf-8")
+        process = Mock(returncode=exit_code, stdout=StringIO(), stderr=StringIO())
+        process.poll.return_value = exit_code
+        return process
+
+    monkeypatch.setattr(
+        "engine.python.basketball_engine.adapters.analysis.subprocess.Popen", start_process,
+    )
+    script = [sys.executable, "refine_dynamic_candidates.py"]
+    command = [*script, "--device", "auto", "--cache-dir", str(tmp_path / "cache")]
+
+    def execute():
+        return run_pipeline(
+            [command], output, manifest_path=manifest, stage_outputs=[output],
+            stage_names=["refine_candidates"],
+        )
+
+    if cpu_exit == 0:
+        assert execute()["refined"] == {"results": []}
+    else:
+        with pytest.raises(RuntimeError, match="refine_dynamic_candidates.py 执行失败"):
+            execute()
+
+    assert calls[0] == command
+    saved = json.loads(manifest.read_text())["stages"]["refine_candidates"]
+    if cpu_exit is None:
+        assert len(calls) == 1
+        assert "cpu_fallback" not in saved
+    else:
+        assert calls[1:] == [[*script, "--device", "cpu"]]
+        assert saved["cpu_fallback"]["exit"] == initial_exit
+    assert saved["state"] == ("completed" if cpu_exit == 0 else "failed")
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX signal return codes")
+@pytest.mark.parametrize("device,exit_code,script_name", [
+    ("cpu", -6, "scan_video.py"),
+    ("auto", 1, "scan_video.py"),
+    ("auto", -6, "other.py"),
+])
+def test_pipeline_does_not_retry_cpu_or_python_errors_or_other_stages(tmp_path, device, exit_code, script_name):
+    script = tmp_path / script_name
+    calls = tmp_path / "calls"
+    script.write_text(
+        f"import os, signal, sys; open({str(calls)!r}, 'a').write('called\\n'); "
+        + ("os.kill(os.getpid(), signal.SIGABRT)" if exit_code < 0 else "sys.exit(1)"),
+        encoding="utf-8",
+    )
+    with pytest.raises(RuntimeError, match="执行失败"):
+        run_pipeline([[sys.executable, str(script), "--device", device]], tmp_path / "output.json")
+    assert calls.read_text() == 'called\n'
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX signal return codes")
+def test_native_crash_cancel_before_cpu_retry(tmp_path):
+    script = tmp_path / "scan_video.py"
+    script.write_text("import os, signal; os.kill(os.getpid(), signal.SIGABRT)", encoding="utf-8")
+    cancelled = False
+    processes = []
+
+    def on_output(stage, line):
+        nonlocal cancelled
+        if "retrying CPU once" in line:
+            cancelled = True
+
+    with pytest.raises(PipelineCancelled):
+        run_pipeline([[sys.executable, str(script), "--device", "auto"]],
+                     tmp_path / "output.json", cancel_check=lambda: cancelled,
+                     output_callback=on_output, process_callback=processes.append)
+    assert len([p for p in processes if p is not None]) == 1
+    assert processes[-1] is None

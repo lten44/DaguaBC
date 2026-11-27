@@ -4,7 +4,7 @@
 
 面向 Windows 的本地篮球集锦工具。导入固定机位、单篮筐的比赛录像，自动找出候选进球，人工复核、补漏后按球员或标签导出 MP4。
 
-**[下载 Windows x64 安装包](https://github.com/lten44/DaguaBC/releases/download/v0.2.21-windows.1/DaguaBC-0.2.21-Windows-x64-Setup.exe)** · [发行说明、源码与校验值](https://github.com/lten44/DaguaBC/releases/tag/v0.2.21-windows.1)
+**[下载 Windows x64 安装包](https://github.com/lten44/DaguaBC/releases/download/v0.2.22/DaguaBC-0.2.22-Windows-x64-Setup.exe)** · [发行说明、源码与校验值](https://github.com/lten44/DaguaBC/releases/tag/v0.2.22)
 
 ## 特别感谢 BHE 原作者
 

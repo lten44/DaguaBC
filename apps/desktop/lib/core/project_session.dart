@@ -758,6 +758,7 @@ class ProjectSession {
     bool? includeUnassigned,
     String effect = 'none',
     JsonMap? encoding,
+    String framing = 'original',
   }) {
     return engine.startExport(
       projectRoot: _requireProjectRoot(),
@@ -768,6 +769,7 @@ class ProjectSession {
       includeUnassigned: includeUnassigned,
       effect: effect,
       encoding: encoding,
+      framing: framing,
     );
   }
 

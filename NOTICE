@@ -12,5 +12,8 @@ The original BHE copyright and MIT license are preserved in LICENSES/BHE-MIT.txt
 Additional rim-check work is credited to EddyLL06 (BHE pull request #18):
 https://github.com/fly7632785/basketball-highlight-editor/pull/18
 
+Selected Windows, review, and export changes adapted from BHE v0.1.16.
+https://github.com/fly7632785/basketball-highlight-editor/releases/tag/v0.1.16
+
 See docs/MODEL_AND_DATA_LICENSES.md and docs/THIRD_PARTY_NOTICES.md
 for the separate terms and provenance of models, assets, and dependencies.

@@ -2914,6 +2914,7 @@ class ProjectNotifier extends Notifier<ProjectState> {
     bool? includeUnassigned,
     String effect = 'none',
     JsonMap? encoding,
+    String framing = 'original',
   }) async {
     if (state.exportStartUnconfirmed) {
       _pushNotice('上一次导出启动结果未确认，请先查看导出任务', NoticeSeverity.warning);
@@ -2929,6 +2930,7 @@ class ProjectNotifier extends Notifier<ProjectState> {
         includeUnassigned: includeUnassigned,
         effect: effect,
         encoding: encoding,
+        framing: framing,
       );
       state = state.copyWith(exportQueued: true);
       _pushNotice('导出会在当前这段分析完成后开始，之后继续排队', NoticeSeverity.info);
@@ -2991,6 +2993,7 @@ class ProjectNotifier extends Notifier<ProjectState> {
             includeUnassigned: includeUnassigned,
             effect: effect,
             encoding: encoding,
+            framing: framing,
           );
       if (_disposed || generation != _projectLoadGeneration) return;
       final job = (result['job'] as Map?)?.cast<String, dynamic>();

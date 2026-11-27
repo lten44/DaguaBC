@@ -26,11 +26,12 @@ Coordinates are normalized to the rim: x = (x - center_x) / width and
 y = (y - rim_y) / width. Rims smaller than 30 px are skipped and left for
 manual review.
 """
+from math import hypot
 from statistics import median
 
 # Motion extraction and the raw detector output are unchanged from v6.
 RIM_DETECTION_CACHE_VERSION = "rim-dense-v6-lateral-review"
-RIM_CHECK_VERSION = "rim-dense-v7-lateral-descent"
+RIM_CHECK_VERSION = "rim-dense-v8-multiple-balls"
 # Same-frame detection and net-response cues adapted from BHE PR #18.
 DUPLICATE_BALL_RADIUS = 0.3
 MIN_NET_RESPONSE_RATIO = 2.0
@@ -201,6 +202,29 @@ def _observed_lateral_descent(track, cross_index):
     return False
 
 
+def _net_exit_during_rise(bottom, rising, tracks):
+    """Find the observed falling ball when the linked track switches to a rising one."""
+    if not 1.0 <= bottom["y"] <= 1.2 or rising["i"] != bottom["i"] + 1:
+        return []
+    exits = []
+    for track in tracks:
+        for index, (falling, lower) in enumerate(zip(track, track[1:])):
+            if (falling["i"] != rising["i"] or lower["i"] != falling["i"] + 1
+                    or abs(falling["x"]) > MAX_EXIT_OFFSET or not lower["y"] > falling["y"] > 1.2):
+                continue
+            if index:
+                overlap = track[index - 1]
+                if (overlap["i"] != bottom["i"] or abs(overlap["x"] - bottom["x"]) > .25
+                        or abs(overlap["y"] - bottom["y"]) > .25):
+                    continue
+            elif hypot(falling["x"] - bottom["x"], falling["y"] - bottom["y"]) > .65:
+                # A single deduplicated box can represent both balls just
+                # before they separate. Accept only a nearby, immediate exit.
+                continue
+            exits.append(track[index:])
+    return exits[0] if len(exits) == 1 else []
+
+
 def _track_crossings(track, tracks):
     others = [other for other in tracks if other is not track]
     for k in range(len(track) - 1):
@@ -214,17 +238,24 @@ def _track_crossings(track, tracks):
             for point in track[:k + 1]
         )
         after = _continuation(track[k + 1:], below, others)
-        exits = [point for point in after if point["y"] >= 0.4 and point["i"] - below["i"] <= 20]
-        deep = [point for point in after if point["y"] >= 1.0 and point["i"] - below["i"] <= 30]
         rebound = False
-        lowest = below["y"]
-        for point in after:
+        lowest = below
+        for index, point in enumerate(after):
             if point["y"] > 1.2:
                 break
-            if point["y"] < lowest - 0.3:
-                rebound = True
+            if point["y"] < lowest["y"] - 0.3:
+                exit_path = []
+                if entry and abs(x_cross) <= MAX_CROSS_OFFSET:
+                    exit_path = _net_exit_during_rise(lowest, point, others)
+                if exit_path:
+                    after = after[:index] + exit_path
+                else:
+                    rebound = True
                 break
-            lowest = max(lowest, point["y"])
+            if point["y"] > lowest["y"]:
+                lowest = point
+        exits = [point for point in after if point["y"] >= 0.4 and point["i"] - below["i"] <= 20]
+        deep = [point for point in after if point["y"] >= 1.0 and point["i"] - below["i"] <= 30]
         last_above = max(
             (point["i"] for point in track[:k + 1] if point["y"] < -0.1),
             default=above["i"],

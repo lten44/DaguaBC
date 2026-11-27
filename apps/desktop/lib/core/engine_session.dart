@@ -546,6 +546,7 @@ class EngineSession {
     bool? includeUnassigned,
     String effect = 'none',
     JsonMap? encoding,
+    String framing = 'original',
   }) {
     return client.request('start_export', <String, dynamic>{
       'project_root': projectRoot,
@@ -557,6 +558,7 @@ class EngineSession {
       ...?_optionalEntry('include_unassigned', includeUnassigned),
       if (effect != 'none') 'effect': effect,
       ...?_optionalEntry('encoding', encoding),
+      if (framing != 'original') 'framing': framing,
     });
   }
 

@@ -5,6 +5,7 @@ import json
 import math
 import shutil
 import sqlite3
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable
@@ -359,6 +360,96 @@ class ProjectStore:
                 "SELECT source_path FROM videos WHERE source_path IS NOT NULL"
             ).fetchall()
         return [str(row["source_path"]) for row in rows]
+
+    def recent_context(self) -> tuple[Dict[str, Any], list[Dict[str, Any]]]:
+        """Read committed list metadata without writing any source DB/sidecar.
+
+        SQLite may update SHM even in mode=ro. Replay WAL only on a disposable
+        copy; if copying races a writer or fails, counts are explicitly unknown.
+        """
+        try:
+            wal = Path(str(self.db_path) + "-wal")
+            if not wal.exists() or wal.stat().st_size == 0:
+                return self._recent_context(self.db_path, immutable=True)
+            files = [self.db_path, wal, Path(str(self.db_path) + "-shm")]
+
+            def signatures():
+                result = {}
+                for path in files:
+                    try:
+                        stat = path.stat()
+                    except FileNotFoundError:
+                        result[path.name] = None
+                    else:
+                        result[path.name] = (stat.st_ino, stat.st_size, stat.st_mtime_ns)
+                return result
+
+            before = signatures()
+            with tempfile.TemporaryDirectory(prefix="bhe-recent-") as directory:
+                snapshot = Path(directory) / self.db_path.name
+                for path in files:
+                    if before[path.name] is not None:
+                        shutil.copyfile(path, Path(directory) / path.name)
+                if signatures() != before:
+                    raise OSError("Recent-project snapshot changed while copying")
+                return self._recent_context(snapshot, immutable=False)
+        except (OSError, sqlite3.Error, ValueError):
+            # Main-file metadata is still useful, but none of its counts can be
+            # trusted after failing to read the committed WAL snapshot.
+            try:
+                context, _ = self._recent_context(self.db_path, immutable=True)
+            except (OSError, sqlite3.Error, ValueError):
+                context = {
+                    "database_path": str(self.db_path), "project_root": str(self.root),
+                    "project": {"name": self.root.name}, "videos": [], "video": None,
+                    "statistics": {key: None for key in (
+                        "candidate_count", "included_count", "goal_count", "excluded_count",
+                        "pending_count", "reviewed_count", "export_count")},
+                }
+            context["statistics"] = {key: None for key in context["statistics"]}
+            return context, []
+
+    def _recent_context(self, db_path: Path, *, immutable: bool) -> tuple[Dict[str, Any], list[Dict[str, Any]]]:
+        uri = db_path.as_uri() + ("?mode=ro&immutable=1" if immutable else "?mode=ro")
+        with sqlite3.connect(uri, uri=True, factory=_ClosingConnection) as connection:
+            connection.row_factory = sqlite3.Row
+            project_row = connection.execute("SELECT * FROM projects LIMIT 1").fetchone()
+            if project_row is None:
+                raise ValueError("PROJECT_NOT_FOUND")
+            project = dict(project_row)
+            tables = {row[0] for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'")}
+            videos = [dict(row) for row in connection.execute("SELECT * FROM videos")] if "videos" in tables else []
+            videos.sort(key=lambda row: (row.get("sort_index", 0), row.get("created_at", ""), row["id"]))
+            for video in videos:
+                video.setdefault("rotation", 0)
+                video.setdefault("sort_index", 0)
+                exists = Path(video["source_path"]).is_file()
+                video.update(source_exists=exists, source_status="linked" if exists else "missing")
+            # Only the stable fields needed for counts and existing-frame lookup.
+            candidates = [dict(row) for row in connection.execute(
+                "SELECT id, video_id, event_time_ms FROM candidates")
+            ] if "candidates" in tables else []
+            statuses = {row["candidate_id"]: row["status"] for row in connection.execute(
+                "SELECT candidate_id, status FROM candidate_reviews")
+            } if "candidate_reviews" in tables else {}
+            for row in candidates:
+                row["selection_status"] = statuses.get(row["id"], "pending")
+            count = len(candidates)
+            excluded = sum(row["selection_status"] == "excluded" for row in candidates)
+            goals = sum(row["selection_status"] == "goal" for row in candidates)
+            pending = sum(row["selection_status"] == "pending" for row in candidates)
+            exports = connection.execute("SELECT COUNT(*) FROM exports").fetchone()[0] if "exports" in tables else 0
+        video = videos[0] if videos else None
+        return {
+            "database_path": str(self.db_path), "project_root": str(self.root),
+            "project": project, "analysis_mode": "standard", "workflow_draft": None,
+            "video": video, "videos": videos, "roi": None,
+            "statistics": {"candidate_count": count, "included_count": count - excluded,
+                           "goal_count": goals, "excluded_count": excluded,
+                           "pending_count": pending, "reviewed_count": count - pending,
+                           "export_count": exports},
+        }, candidates
 
     def context(self) -> Dict[str, Any]:
         project = self.project()
@@ -878,6 +969,20 @@ class ProjectStore:
             # Exact matches (especially preserved manual candidates) must not
             # have their review consumed by an earlier nearby new candidate.
             used_old: set[str] = set(existing_candidates).intersection(str(row["id"]) for row in rows)
+
+            def unique_nearest(event, options):
+                nearest_id = None
+                nearest_distance = 2_001
+                for option in options:
+                    if option.get("roi_id") != event.get("roi_id"):
+                        continue
+                    distance = abs(option["event_time_ms"] - event["event_time_ms"])
+                    if distance < nearest_distance:
+                        nearest_id, nearest_distance = str(option["id"]), distance
+                    elif distance == nearest_distance:
+                        nearest_id = None
+                return nearest_id
+
             for row in rows:
                 candidate_id = str(row["id"])
                 review = existing_reviews.get(candidate_id)
@@ -886,21 +991,14 @@ class ProjectStore:
                     # An exact ID match consumes the old review so a second
                     # nearby new candidate cannot inherit it as well.
                     used_old.add(candidate_id)
-                if review is None:
-                    candidates = [
-                        (abs(int(old["event_time_ms"]) - int(row["event_time_ms"])), old_id, old)
-                        for old_id, old in existing_candidates.items()
-                        if old_id not in used_old
-                        and old.get("roi_id") == row.get("roi_id")
-                        and abs(int(old["event_time_ms"]) - int(row["event_time_ms"])) <= 2_000
-                        and old_id in existing_reviews
-                    ]
-                    candidates.sort(key=lambda item: (item[0], item[1]))
-                    if candidates and (
-                        len(candidates) == 1
-                        or candidates[0][0] < candidates[1][0]
+                if old_candidate is None:
+                    # Match the original sets in both directions. A reserved or
+                    # ambiguous nearest event must not fall back to another play.
+                    old_id = unique_nearest(row, existing_candidates.values())
+                    if old_id in existing_reviews and old_id not in used_old and (
+                        unique_nearest(existing_candidates[old_id], rows) == candidate_id
                     ):
-                        _, old_id, old_candidate = candidates[0]
+                        old_candidate = existing_candidates[old_id]
                         review = existing_reviews[old_id]
                         used_old.add(old_id)
                 if old_candidate is not None:

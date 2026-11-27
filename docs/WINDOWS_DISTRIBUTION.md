@@ -1,6 +1,6 @@
 # Windows x64 发行包与对应源码
 
-DaguaBC 0.2.21 的 Windows 安装版按 [GNU AGPL-3.0](../LICENSE) 提供。感谢 Jafir、EddyLL06 及 BHE 的所有贡献者。安装包提供 [BHE 的原 MIT 许可](../LICENSES/BHE-MIT.txt) 和 [署名记录](../NOTICE)。字体、模型和独立的第三方运行组件沿用各自的条款。
+DaguaBC 0.2.22 的 Windows 安装版按 [GNU AGPL-3.0](../LICENSE) 提供。感谢 Jafir、EddyLL06 及 BHE 的所有贡献者。安装包提供 [BHE 的原 MIT 许可](../LICENSES/BHE-MIT.txt) 和 [署名记录](../NOTICE)。字体、模型和独立的第三方运行组件沿用各自的条款。
 
 ## 应用与推理引擎
 
