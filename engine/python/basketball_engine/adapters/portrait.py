@@ -398,7 +398,7 @@ def compose_portrait(balls, hoops, width, height, goal_seconds, *, people=None, 
 
 
 class PortraitTracker:
-    def __init__(self, model_path: Path):
+    def __init__(self, model_path: Path, *, shooter_model_path=None):
         from basketball_highlight.inference import load_detector, select_device, current_device
 
         select_device("auto", model_path)
@@ -408,6 +408,11 @@ class PortraitTracker:
         person_path = Path(configured).expanduser() if configured else model_path.parent / "local" / "yolo11n.pt"
         self.person_model = load_detector(person_path, self.device) if person_path.is_file() else None
         self.person_device = current_device()
+        self.shooter_detector = None
+        if shooter_model_path is not None:
+            from .shooter_framing import PersonDetector
+
+            self.shooter_detector = PersonDetector(shooter_model_path)
 
     @staticmethod
     def _sample_frames(capture, start, count, fps, cancel_check):
@@ -481,6 +486,10 @@ class PortraitTracker:
             start = candidate["review_start_ms"] / 1000
             duration = (candidate["review_end_ms"] - candidate["review_start_ms"]) / 1000
             count = max(1, math.ceil(duration * SAMPLE_FPS))
+            shooter_detector = getattr(self, "shooter_detector", None)
+            shooter_balls, shooter_people = [], []
+            goal_index = (min(count-1,max(0,round((candidate["event_time_ms"]/1000-start)*SAMPLE_FPS)))
+                          if shooter_detector else 0)
             previous = None
             ball_boxes, hoop_frames, people = [], [], []
             person_model = getattr(self, "person_model", None)
@@ -505,6 +514,10 @@ class PortraitTracker:
                 if value is not None:
                     previous = value
                 ball_boxes.append(max(balls)[2] if balls else None)
+                if shooter_detector:
+                    shooter_balls.append([entry[2] for entry in balls])
+                    shooter_people.append(shooter_detector.detect(frame)
+                                          if goal_index-43 <= index <= goal_index+2 else [])
                 persons = None
                 if person_model is not None and index % PEOPLE_STRIDE == 0:
                     detected = person_model.predict(frame, device=self.person_device, conf=.25, imgsz=640,
@@ -538,12 +551,43 @@ class PortraitTracker:
                 progress_callback("portrait_tracking", 1.)
             if cancel_check and cancel_check():
                 raise PipelineCancelled("JOB_CANCELLED")
-            single_event = None if candidate.get("manual") else candidate.get("event_time_ms")
+            single_event = (None if candidate.get("manual") and not shooter_detector
+                            else candidate.get("event_time_ms"))
             events = candidate.get("portrait_events_ms", [single_event])
             goals = [(event - candidate["review_start_ms"]) / 1000
                      for event in events if event is not None]
             self.last_composition = compose_portrait(ball_boxes, hoop_frames, width, height, goals,
                                                      people=people, local_balls=local_balls)
+            if shooter_detector:
+                from .shooter_framing import (
+                    PAN_VERSION, find_shooter, rim_anchor, steady_ball_centers, subject_centers,
+                )
+
+                rim = self.last_composition["rim"]
+                known_rim = candidate.get("rim")
+                if known_rim and isinstance(known_rim.get("width"), (int, float)):
+                    x,y,w = (known_rim[field] for field in ("x","y","width"))
+                    if all(math.isfinite(v) for v in (x,y,w)) and 0 < x < width and 0 < y < height and 2 < w < .13*width:
+                        rim = (x-w/2, y-.15*w, x+w/2, y+.35*w)
+                # High-resolution local detections supplement the wide view near the rim.
+                for wide, local in zip(shooter_balls, local_balls):
+                    wide.extend(box for box in local if all(math.dist(_center(box),_center(other)) > .15*(box[2]-box[0])
+                                                            for other in wide))
+                subject, reason = find_shooter(shooter_balls, shooter_people, rim, goal_index)
+                base = self.last_composition["centers"]
+                rim_x = rim_anchor(base, width, goal_index, _center(rim)[0] if rim else None)
+                ball_points = [[_center(box) for box in row] for row in shooter_balls]
+                self.last_shooter_plan = {
+                    "width": width, "height": height, "goal_index": goal_index,
+                    "base": base, "people": shooter_people, "ball_points": ball_points,
+                    "reason": reason, "rim_x": rim_x, "pan_version": PAN_VERSION,
+                    "status": "auto" if subject else "pending",
+                    "release_index": subject[0] if subject else max(0,goal_index-8),
+                    "centers": (subject_centers(base, width, height, goal_index, subject, rim_x=rim_x,
+                                                ball_points=ball_points, people=shooter_people)
+                                if subject else steady_ball_centers(base, width, height, goal_index, rim_x=rim_x)),
+                    "subject_x": subject[2] / width if subject else None,
+                }
             return self.last_composition["filter"]
         finally:
             capture.release()

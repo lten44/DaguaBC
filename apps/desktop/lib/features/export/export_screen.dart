@@ -21,6 +21,7 @@ import '../../providers/export_output_picker.dart';
 import '../../theme/app_colors.dart';
 import '../../theme/tokens.dart';
 import 'game_stats.dart';
+import 'portrait_trial_dialog.dart';
 
 @visibleForTesting
 final exportDialogLogProvider = Provider<void Function(String, String, String)>((ref) => appLog);
@@ -344,9 +345,11 @@ class _ExportScreenState extends ConsumerState<ExportScreen> {
           child: Wrap(
             spacing: Spacing.sm,
             children: [
-              for (final option in const {
+              for (final option in {
                 'original': '原比例',
                 'portrait_916': '竖屏 9:16（跟球）',
+                if (Platform.isWindows)
+                  'portrait_shooter_trial': '竖屏 9:16（人物居中）',
               }.entries)
                 ChoiceChip(
                   key: Key('export-framing-${option.key}'),
@@ -691,6 +694,25 @@ class _ExportScreenState extends ConsumerState<ExportScreen> {
       final videoId = ref.read(projectProvider).video?['id'];
       final playerIds = _playerFilterActive ? _selectedPlayerIds.toList() : null;
       final includeUnassigned = _playerFilterActive ? _includeUnassigned : null;
+      if (_framing == 'portrait_shooter_trial') {
+        await notifier.flushReviewQueue();
+        if (!mounted) return;
+        final scope = ref.read(projectSessionProvider).snapshot();
+        final approved = await showDialog<bool>(
+          context: context,
+          barrierDismissible: false,
+          builder: (_) => PortraitTrialDialog(
+            engine: scope.engine,
+            projectRoot: scope.projectRoot,
+            playerIds: playerIds,
+            includeUnassigned: includeUnassigned,
+          ),
+        );
+        if (approved != true || !mounted ||
+            ref.read(projectSessionProvider).projectRoot != scope.projectRoot) {
+          return;
+        }
+      }
       final picker = ref.read(exportOutputPickerProvider);
       final path = await ref
           .read(playbackCoordinatorProvider)

@@ -15,5 +15,8 @@ https://github.com/fly7632785/basketball-highlight-editor/pull/18
 Selected Windows, review, and export changes adapted from BHE v0.1.16.
 https://github.com/fly7632785/basketball-highlight-editor/releases/tag/v0.1.16
 
+The portrait ball-following export is adapted from BHE v0.1.16. DaguaBC 0.3.0 adds
+shooter-centered framing, a receiving lead-in, and pre-export framing review for Windows.
+
 See docs/MODEL_AND_DATA_LICENSES.md and docs/THIRD_PARTY_NOTICES.md
 for the separate terms and provenance of models, assets, and dependencies.

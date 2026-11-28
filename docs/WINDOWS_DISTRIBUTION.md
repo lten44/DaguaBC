@@ -1,6 +1,6 @@
 # Windows x64 发行包与对应源码
 
-DaguaBC 0.2.22 的 Windows 安装版按 [GNU AGPL-3.0](../LICENSE) 提供。感谢 Jafir、EddyLL06 及 BHE 的所有贡献者。安装包提供 [BHE 的原 MIT 许可](../LICENSES/BHE-MIT.txt) 和 [署名记录](../NOTICE)。字体、模型和独立的第三方运行组件沿用各自的条款。
+DaguaBC 0.3.0 的 Windows 安装版按 [GNU AGPL-3.0](../LICENSE) 提供。感谢 Jafir、EddyLL06 及 BHE 的所有贡献者。安装包提供 [BHE 的原 MIT 许可](../LICENSES/BHE-MIT.txt) 和 [署名记录](../NOTICE)。字体、模型和独立的第三方运行组件沿用各自的条款。
 
 ## 应用与推理引擎
 
@@ -8,6 +8,7 @@ DaguaBC 0.2.22 的 Windows 安装版按 [GNU AGPL-3.0](../LICENSE) 提供。感�
 - Python 3.11.16 及第三方 Python 包随安装器提供，实际包版本记录于源码附件的 `runtime-requirements.txt`。安装目录中的包元数据和许可文件用于核对归属。Python 运行时来自 [python-build-standalone 20260814](https://github.com/astral-sh/python-build-standalone/releases/tag/20260814)。Windows Visual C++ 14.44 运行库采用微软的 [应用本地再分发条款](https://learn.microsoft.com/visualstudio/releases/2022/redistribution)，其余运行组件保留包内许可。
 - CPU 推理使用 `ultralytics` 8.4.208。对应源码附件提供该版本以及 `ultralytics-platform` 0.1.108 和 `ultralytics-thop` 2.2.5 在 PyPI 发布的源码分发文件。GPU 路径使用 ONNX Runtime DirectML 1.24.4。[Ultralytics 源码](https://pypi.org/project/ultralytics/8.4.208/#files) · [ONNX Runtime 源码](https://github.com/microsoft/onnxruntime/tree/v1.24.4) · [DirectML](https://github.com/microsoft/DirectML)
 - 原始 `bball_model.pt` 来自上游 BHE，随应用提供。动态批次 `bball_model.onnx` 由同一权重通过 `scripts/export_mobile_model.py --dynamic` 导出。源码附件同时提供原始权重及其校验值。原训练集和用户本机数据不随发行版提供。[模型来源及许可](MODEL_AND_DATA_LICENSES.md)
+- 竖屏人物居中所用的 YOLOX-Nano 权重从上游官方 Release 单独下载。用户需要确认下载，后续构图、预览与导出均在本地运行。[人物模型来源及校验值](MODEL_AND_DATA_LICENSES.md#竖屏人物检测)
 
 ## 三个媒体组件
 

@@ -73,6 +73,7 @@ class EngineService:
         self._store_lock = threading.Lock()
         self._job_lock = threading.Lock()
         self._detector_preflight = DetectorPreflight()
+        self._shooter_tracker = None
 
     def shutdown(self, timeout: float = 5.0) -> None:
         with self._job_lock:
@@ -159,6 +160,10 @@ class EngineService:
             "update_clip_range": self.update_clip_range,
             "update_clip_ranges": self.update_clip_ranges,
             "start_export": self.start_export,
+            "portrait_trial_list": self.portrait_trial_list,
+            "portrait_trial_prepare": self.portrait_trial_prepare,
+            "portrait_trial_frame": self.portrait_trial_frame,
+            "portrait_trial_decide": self.portrait_trial_decide,
             "list_exports": self.list_exports,
             "get_statistics": self.get_statistics,
             "set_telemetry_consent": self.set_telemetry_consent,
@@ -184,6 +189,7 @@ class EngineService:
         if not isinstance(root_path, str) or not root_path.strip():
             raise ProtocolError("INVALID_REQUEST", "缺少 project_root")
         key = str(Path(root_path).expanduser().resolve())
+        self._trial_scope(Path(key))
         with self._store_lock:
             store = self.stores.get(key)
             if store is None:
@@ -197,6 +203,7 @@ class EngineService:
         if not isinstance(root_path, str) or not root_path.strip():
             raise ProtocolError("INVALID_REQUEST", "缺少 project_root")
         root = Path(root_path).expanduser().resolve()
+        self._trial_scope(root)
         if not root.is_dir() or not (root / "project.db").is_file():
             raise ProtocolError("PROJECT_NOT_FOUND", f"项目不存在: {root}")
         store = ProjectStore(root)
@@ -210,6 +217,12 @@ class EngineService:
 
     def _require_store(self, payload: Dict[str, Any]) -> ProjectStore:
         return self._existing_store(payload)[0]
+
+    @staticmethod
+    def _trial_scope(root: Path):
+        allowed = os.environ.get("BHE_PORTRAIT_TRIAL_ROOT")
+        if allowed and not root.is_relative_to(Path(allowed).resolve()):
+            raise ProtocolError("TRIAL_PROJECT_ONLY", "竖屏测试版只打开测试版 projects 目录内的工程副本")
 
     def create_project(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         name = payload.get("name")
@@ -427,6 +440,7 @@ class EngineService:
             if not isinstance(raw_root, str) or not raw_root.strip():
                 raise ProtocolError("INVALID_REQUEST", "roots 中的目录必须是非空字符串")
             root = Path(raw_root).expanduser().resolve()
+            self._trial_scope(root)
             scanned_roots.append(str(root))
             if not root.is_dir():
                 continue
@@ -1480,7 +1494,9 @@ class EngineService:
         video_id = retry_payload["video_id"]
         if not store.project() or (video_id is not None and not store.video(video_id)):
             raise ProtocolError("VIDEO_NOT_FOUND", "导出任务缺少有效视频")
-        self._export_candidate_snapshot(store, video_id, retry_payload)
+        _, _, snapshot = self._export_candidate_snapshot(store, video_id, retry_payload)
+        if retry_payload.get("framing") == "portrait_shooter_trial":
+            self._portrait_trial_snapshot(store, snapshot)
         if job.get("state") in {"running", "queued"}:
             store.update_job(
                 job_id,
@@ -2997,8 +3013,223 @@ class EngineService:
             raise ProtocolError("NO_EXPORT_CANDIDATES", "没有可导出的候选片段")
         return requested_player_ids, include_unassigned, candidate_snapshot
 
+    def portrait_trial_list(self, payload):
+        store = self._require_store(payload)
+        _, _, candidates = self._export_candidate_snapshot(store, None, payload)
+        return {"clips": [{key: candidate[key] for key in (
+            "id", "event_time_ms", "review_start_ms", "review_end_ms", "player_name"
+        )} for candidate in candidates]}
+
+    def _portrait_trial_inputs(self, payload):
+        store = self._require_store(payload)
+        _, _, candidates = self._export_candidate_snapshot(store, None, {})
+        candidate = next((item for item in candidates if item["id"] == payload.get("candidate_id")), None)
+        if candidate is None:
+            raise ProtocolError("PORTRAIT_CLIP_CHANGED", "片段已调整，请返回重新准备")
+        video = store.video(candidate["video_id"])
+        source = self._validated_source(video, verify_content=False)
+        return store, candidate, source
+
+    @staticmethod
+    def _portrait_trial_path(store, candidate, source):
+        stat = source.stat()
+        key = json.dumps([str(source), stat.st_size, stat.st_mtime_ns, candidate["video_id"],
+                          candidate["id"], candidate["review_start_ms"], candidate["review_end_ms"],
+                          candidate["event_time_ms"], candidate.get("rim"), "shooter-trial-v1"], sort_keys=True)
+        token = hashlib.sha256(key.encode()).hexdigest()[:24]
+        return store.root / "artifacts" / "portrait_trial" / token / "plan.json"
+
+    @staticmethod
+    def _write_portrait_trial(path, plan):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(".tmp")
+        begin_commit()
+        try:
+            temporary.write_text(json.dumps(plan, separators=(",",":"), allow_nan=False), encoding="utf-8")
+            temporary.replace(path)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    @staticmethod
+    def _portrait_trial_summary(plan):
+        return {key: plan[key] for key in ("status", "reason", "release_ms", "subject_x")}
+
+    @staticmethod
+    def _read_portrait_trial(path, candidate):
+        from .adapters.shooter_framing import (
+            PAN_VERSION, rim_anchor, steady_ball_centers, subject_centers,
+        )
+
+        plan = json.loads(path.read_text(encoding="utf-8"))
+        if plan.get("pan_version") == PAN_VERSION:
+            return plan, False
+
+        # Existing trial choices already retain the release and selected x.
+        # Rebuild only the camera move when opening curves from the old trial.
+        base, width, height, goal = (plan[key] for key in ("base", "width", "height", "goal_index"))
+        hint = plan.get("rim_x", (candidate.get("rim") or {}).get("x"))
+        rim_x = rim_anchor(base, width, goal, hint)
+        if plan["status"] in {"auto", "manual"}:
+            subject = plan["release_index"], {}, plan["subject_x"] * width
+            centers = subject_centers(base, width, height, goal, subject, rim_x=rim_x,
+                                      ball_points=plan.get("ball_points", ()), people=plan.get("people", ()))
+        else:
+            centers = steady_ball_centers(base, width, height, goal, rim_x=rim_x)
+        plan.update(pan_version=PAN_VERSION, rim_x=rim_x, centers=centers)
+        return plan, True
+
+    def portrait_trial_prepare(self, payload):
+        from .adapters.portrait import PortraitTracker, SAMPLE_FPS
+
+        store, candidate, source = self._portrait_trial_inputs(payload)
+        path = self._portrait_trial_path(store, candidate, source)
+        if path.is_file():
+            plan, upgraded = self._read_portrait_trial(path, candidate)
+            if upgraded:
+                self._write_portrait_trial(path, plan)
+            return self._portrait_trial_summary(plan)
+        root = Path(os.environ.get("BHE_RUNTIME_ROOT") or Path(__file__).resolve().parents[3])
+        if self._shooter_tracker is None:
+            model = root / "models" / "bball_model.pt"
+            people = self._portrait_person_model(root, download=payload.get("download_person_model") is True)
+            self._shooter_tracker = PortraitTracker(model, shooter_model_path=people)
+        self._shooter_tracker.track({**candidate, "source_path": str(source)}, check_cancelled)
+        plan = self._shooter_tracker.last_shooter_plan
+        plan.update(start_ms=candidate["review_start_ms"], end_ms=candidate["review_end_ms"],
+                    event_ms=candidate["event_time_ms"])
+        plan["release_ms"] = min(plan["end_ms"]-1, plan["start_ms"]+plan["release_index"]*(1000//SAMPLE_FPS))
+        if path != self._portrait_trial_path(store, candidate, source):
+            raise ProtocolError("VIDEO_SOURCE_CHANGED", "视频已变化，请重新准备")
+        self._write_portrait_trial(path, plan)
+        return self._portrait_trial_summary(plan)
+
+    @staticmethod
+    def _portrait_person_model(root, *, download):
+        from tempfile import NamedTemporaryFile
+        from urllib.request import urlopen
+
+        name = "yolox_nano.onnx"
+        base = Path(os.environ["LOCALAPPDATA"]) if os.environ.get("LOCALAPPDATA") else Path.home() / ".cache"
+        cache = base / "DaguaBC" / "models" / name
+        expected_size = 3_659_407
+        expected_hash = "c789161ed43c8269fcd4e67c67eeeb4e80c622da2eb296a20bc6007bd18a0b7d"
+        for path in (cache, root / "models" / "local" / name):
+            if path.is_file() and path.stat().st_size == expected_size:
+                with path.open("rb") as model:
+                    if hashlib.file_digest(model, "sha256").hexdigest() == expected_hash:
+                        return path
+        if not download:
+            raise ProtocolError(
+                "PORTRAIT_MODEL_MISSING",
+                "人物居中首次使用需要从 YOLOX 官方下载人物检测模型。完成一次后可离线使用。",
+            )
+
+        url = "https://github.com/Megvii-BaseDetection/YOLOX/releases/download/0.1.1rc0/" + name
+        try:
+            with urlopen(url, timeout=25) as response:
+                data = response.read(expected_size + 1)
+            if len(data) != expected_size or hashlib.sha256(data).hexdigest() != expected_hash:
+                raise ValueError("Downloaded YOLOX asset did not match the verified model")
+            check_cancelled()
+            cache.parent.mkdir(parents=True, exist_ok=True)
+            with NamedTemporaryFile(dir=cache.parent, suffix=".download", delete=False) as temporary:
+                temporary_path = Path(temporary.name)
+            try:
+                temporary_path.write_bytes(data)
+                temporary_path.replace(cache)
+            finally:
+                temporary_path.unlink(missing_ok=True)
+        except (OSError, ValueError) as exc:
+            log_diagnostic(f"portrait person model download failed: {type(exc).__name__}")
+            raise ProtocolError(
+                "PORTRAIT_MODEL_DOWNLOAD",
+                "人物模型下载或校验失败。请检查到 GitHub 的连接后重试，也可以返回选择竖屏跟球。",
+            ) from exc
+        return cache
+
+    def portrait_trial_frame(self, payload):
+        import cv2
+        from .adapters.portrait import _crop_size
+        from .adapters.shooter_framing import profile_center
+
+        store, candidate, source = self._portrait_trial_inputs(payload)
+        path = self._portrait_trial_path(store,candidate,source)
+        if not path.is_file():
+            raise ProtocolError("PORTRAIT_PREPARE_REQUIRED", "请先准备竖屏构图")
+        plan, _ = self._read_portrait_trial(path, candidate)
+        ms = payload.get("time_ms")
+        if type(ms) is not int or not plan["start_ms"] <= ms < plan["end_ms"]:
+            raise ProtocolError("INVALID_REQUEST", "预览时间超出片段")
+        image = path.parent / f"frame-{ms}.jpg"
+        if not image.is_file():
+            capture = cv2.VideoCapture(str(source))
+            try:
+                capture.set(cv2.CAP_PROP_POS_MSEC, ms)
+                ok, frame = capture.read()
+                if not ok:
+                    raise ProtocolError("VIDEO_OPEN_FAILED", "取帧失败，请向前移动一点再试")
+            finally:
+                capture.release()
+            height,width = frame.shape[:2]
+            scale = min(1,1280/width,720/height)
+            frame = cv2.resize(frame,(round(width*scale),round(height*scale)),interpolation=cv2.INTER_AREA)
+            ok, encoded = cv2.imencode(".jpg",frame,[cv2.IMWRITE_JPEG_QUALITY,88])
+            if not ok:
+                raise ProtocolError("VIDEO_OPEN_FAILED", "无法生成选人画面")
+            begin_commit()
+            image.write_bytes(encoded.tobytes())
+        width,height = plan["width"],plan["height"]
+        crop_width,crop_height = _crop_size(width,height)
+        return {"path":str(image), "left":(profile_center(plan,ms)-crop_width/2)/width,
+                "top":(height-crop_height)/(2*height), "width":crop_width/width,
+                "height":crop_height/height, "aspect":width/height, "time_ms":ms}
+
+    def portrait_trial_decide(self, payload):
+        from .adapters.portrait import SAMPLE_FPS
+        from .adapters.shooter_framing import aim_at_point, steady_ball_centers, subject_centers
+
+        store,candidate,source = self._portrait_trial_inputs(payload)
+        path = self._portrait_trial_path(store,candidate,source)
+        if not path.is_file():
+            raise ProtocolError("PORTRAIT_PREPARE_REQUIRED", "请先准备竖屏构图")
+        plan, _ = self._read_portrait_trial(path, candidate)
+        base, width, height, goal = (plan[key] for key in ("base", "width", "height", "goal_index"))
+        rim_x = plan["rim_x"]
+        if payload.get("choice") == "ball":
+            centers = steady_ball_centers(base, width, height, goal, rim_x=rim_x)
+            plan.update(status="ball", centers=centers, subject_x=None)
+        elif payload.get("choice") == "manual":
+            ms,x,y = (payload.get(key) for key in ("time_ms","x","y"))
+            if (type(ms) is not int or not plan["start_ms"] <= ms < plan["end_ms"]
+                    or not all(type(v) in (int,float) and math.isfinite(v) and 0 <= v <= 1 for v in (x,y))):
+                raise ProtocolError("INVALID_REQUEST", "请在片段内的出手画面点选球员")
+            index = min(len(plan["base"])-1, round((ms-plan["start_ms"])*SAMPLE_FPS/1000))
+            subject = aim_at_point(plan["people"],index,x*plan["width"],y*plan["height"])
+            centers = subject_centers(base, width, height, goal, subject, rim_x=rim_x,
+                                      ball_points=plan.get("ball_points", ()), people=plan["people"])
+            plan.update(status="manual",centers=centers,release_index=index,release_ms=ms,
+                        subject_x=subject[2]/plan["width"])
+        else:
+            raise ProtocolError("INVALID_REQUEST", "构图选择无效")
+        self._write_portrait_trial(path,plan)
+        return self._portrait_trial_summary(plan)
+
+    def _portrait_trial_snapshot(self, store, snapshot):
+        videos = {}
+        for candidate in snapshot:
+            video_id = candidate["video_id"]
+            if video_id not in videos:
+                videos[video_id] = self._validated_source(store.video(video_id), verify_content=False)
+            path = self._portrait_trial_path(store, candidate, videos[video_id])
+            plan = self._read_portrait_trial(path, candidate)[0] if path.is_file() else None
+            if plan is None or plan["status"] not in {"auto","manual","ball"}:
+                raise ProtocolError("PORTRAIT_REVIEW_REQUIRED", "还有片段待确认构图，请先完成竖屏预览")
+            candidate["portrait_profiles"] = [{key:plan[key] for key in (
+                "start_ms","end_ms","event_ms","width","height","centers"
+            )}]
+
     def start_export(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-        if payload.get("framing", "original") not in ("original", "portrait_916", "portrait_blur"):
+        if payload.get("framing", "original") not in ("original", "portrait_916", "portrait_blur", "portrait_shooter_trial"):
             raise ProtocolError("INVALID_REQUEST", "画面格式无效")
         try:
             settings = ExportSettings.parse(payload.get("encoding"))
@@ -3031,6 +3262,8 @@ class EngineService:
             requested_player_ids, include_unassigned, candidate_snapshot = (
                 self._export_candidate_snapshot(store, video_id, payload)
             )
+            if payload.get("framing") == "portrait_shooter_trial":
+                self._portrait_trial_snapshot(store, candidate_snapshot)
             selected_players = set(requested_player_ids or [])
             checkpoint = {
                 "mode": payload.get("mode", "separate"),

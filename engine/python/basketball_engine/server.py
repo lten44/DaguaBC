@@ -1,5 +1,6 @@
 import errno
 import json
+import os
 import queue
 import sys
 import threading
@@ -51,6 +52,10 @@ class _RequestWorker:
 
 
 def main() -> int:
+    if sys.platform == "win32" and os.environ.get("BHE_RUNTIME_ROOT"):
+        # Load Windows native video dependencies before the request worker starts.
+        import cv2
+
     service = EngineService()
     output_stream = sys.stdout
     output_lock = threading.Lock()
@@ -63,6 +68,7 @@ def main() -> int:
     tickets = {}
     closing = False
     slow_commands = {"link_video", "relink_video", "suggest_roi", "open_project", "extract_preview"}
+    slow_commands.update({"portrait_trial_prepare", "portrait_trial_frame", "portrait_trial_decide"})
     review_commands = {"start_review", "review_candidate", "set_candidate_player", "set_candidates_player"}
     protected_commands = slow_commands | {
         "create_project", "delete_project", "start_analysis", "start_export",
@@ -85,7 +91,7 @@ def main() -> int:
         command = request["command"]
         key = project_key(payload)
         request_id = request.get("request_id")
-        if key is not None and command in {"open_project", "link_video", "relink_video", "extract_preview", "suggest_roi", "delete_project", "create_project", "start_analysis"}:
+        if key is not None and (command in {"open_project", "link_video", "relink_video", "extract_preview", "suggest_roi", "delete_project", "create_project", "start_analysis"} or command.startswith("portrait_trial_")):
             with service._job_lock:
                 if key in service._export_projects:
                     raise ProtocolError("PROJECT_BUSY", "项目正在导出，请等待完成或取消")

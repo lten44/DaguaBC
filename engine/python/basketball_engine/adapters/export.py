@@ -706,6 +706,9 @@ def merge_overlapping_candidates(candidates, *, keep_portrait_events=False):
                 for event in candidate.get("portrait_events_ms", [candidate.get("event_time_ms")])
                 if event is not None
             })
+        profiles = [profile for _, candidate in group for profile in candidate.get("portrait_profiles", [])]
+        if profiles:
+            combined["portrait_profiles"] = profiles
         merged.append(combined)
     return merged
 
@@ -766,8 +769,12 @@ def merge_duplicate_events(candidates):
     result = []
     for group in sorted(groups, key=lambda g: min(x[0] for x in g)):
         first = min(group, key=lambda x: x[0])[1]
-        result.append({**first, 'review_start_ms': min(int(x[1]['review_start_ms']) for x in group),
-                       'review_end_ms': max(int(x[1]['review_end_ms']) for x in group)})
+        combined = {**first, 'review_start_ms': min(int(x[1]['review_start_ms']) for x in group),
+                    'review_end_ms': max(int(x[1]['review_end_ms']) for x in group)}
+        if "portrait_profiles" in first:
+            combined["portrait_profiles"] = [profile for _, item in group
+                                              for profile in item["portrait_profiles"]]
+        result.append(combined)
     return result
 
 
@@ -786,7 +793,8 @@ def export_goal_clips(
     # Old export checkpoints may still carry the retired layout identifier.
     if framing == "portrait_blur":
         framing = "portrait_916"
-    if framing not in {"original", "portrait_916"}:
+    shooter_trial = framing == "portrait_shooter_trial"
+    if framing not in {"original", "portrait_916", "portrait_shooter_trial"}:
         raise ValueError("INVALID_EXPORT_FRAMING")
     if mode not in {"separate", "merge"}:
         raise ValueError("INVALID_EXPORT_MODE")
@@ -819,7 +827,7 @@ def export_goal_clips(
             model = repo_root / "third_party" / "basketball-shot-detection" / "bball_model.pt"
         tracker = PortraitTracker(model)
     first = candidates[0] if candidates else {}
-    target_size = (1080, 1920) if tracker else (first.get("width"), first.get("height"))
+    target_size = (1080, 1920) if tracker or shooter_trial else (first.get("width"), first.get("height"))
     if settings is not None and None not in target_size:
         target_size = settings.frame_size(*target_size)
     try:
@@ -831,6 +839,12 @@ def export_goal_clips(
                     progress_callback(stage, ((index - 1) + fraction) / max(1, len(candidates)))
 
             portrait = tracker.track(candidate, cancel_check, tracking_progress) if tracker else None
+            if shooter_trial:
+                from .shooter_framing import export_profile_filter
+
+                if not candidate.get("portrait_profiles"):
+                    raise ValueError("竖屏构图快照缺失")
+                portrait = export_profile_filter(candidate)
             spec = effect_spec(candidate, effect)
             total_ms += output_duration_ms(candidate, spec)
             codec = run_encoded_ffmpeg(
